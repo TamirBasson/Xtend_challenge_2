@@ -136,6 +136,20 @@ def on_key_event(event) -> None:
 def update_controls() -> None:
     while True:
         if control_state["autopilot"]:
+            # Keep camera-view control available during autonomy without touching
+            # navigation axes (forward/strafe/altitude/yaw from KBVS).
+            if control_state["arrow_right"]:
+                control_state["yaw"] = clamp(-1, control_state["yaw"] + 0.05, 1)
+            elif control_state["arrow_left"]:
+                control_state["yaw"] = clamp(-1, control_state["yaw"] - 0.05, 1)
+            if control_state["joy_left"]:
+                control_state["joy_horizontal"] = -1
+            elif control_state["joy_right"]:
+                control_state["joy_horizontal"] = 1
+            else:
+                control_state["joy_horizontal"] = 0
+            if control_state["btnCdown"]:
+                control_state["yaw"] = 0
             time.sleep(1 / 60)
             continue
         if control_state["trigger"] > 0 and not control_state["trigger_down"]:

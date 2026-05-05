@@ -6,6 +6,7 @@ import numpy as np
 
 from xlabs_nav.drone_control_adapter import stop_drone
 from xlabs_nav.keyframe_manager import KeyframeManager
+from xlabs_nav.keyframe_prefilter import compute_global_descriptor, global_similarity
 from xlabs_nav.mission_config import MissionConfig
 from xlabs_nav.orb_matcher import extract_orb_features, match_orb_features
 from xlabs_nav.servo_controller import ServoPidController
@@ -32,14 +33,114 @@ def _selection_params(cfg: dict[str, Any]) -> dict[str, Any]:
         "min_matches": int(ks.get("min_matches", qc.get("minimum_matches", 12))),
         "min_inliers": int(ks.get("min_inliers", qc.get("minimum_inliers", 8))),
         "max_keyframes_to_score": int(ks.get("max_keyframes_to_score", 0)),
+        # Real-time pre-filter: shrink the candidate set scored with full ORB+RANSAC.
+        # See _build_candidate_indices for semantics.
+        "enable_prefilter": bool(ks.get("enable_prefilter", True)),
+        "window_lookahead": int(ks.get("window_lookahead", 0)),
+        "window_lookback": int(ks.get("window_lookback", 0)),
+        "top_k": int(ks.get("top_k", 0)),
+        "global_descriptor_size": int(ks.get("global_descriptor_size", 32)),
     }
 
 
 def _scan_indices(active: int, total: int, max_score: int) -> list[int]:
+    """Legacy forward-first scan (used when enable_prefilter is False)."""
     order = list(range(active, total)) + list(range(0, active))
     if max_score > 0 and len(order) > max_score:
         return order[:max_score]
     return order
+
+
+def _windowed_indices(active: int, total: int, lookback: int, lookahead: int) -> list[int]:
+    """Indices in [active - lookback, active + lookahead], clamped to [0, total)."""
+    if total <= 0:
+        return []
+    lookback = max(0, int(lookback))
+    lookahead = max(0, int(lookahead))
+    lo = max(0, active - lookback)
+    hi = min(total, active + lookahead + 1)
+    return list(range(lo, hi))
+
+
+def _rank_by_global_descriptor(
+    indices: list[int],
+    keyframes: KeyframeManager,
+    current_gdesc: np.ndarray | None,
+) -> list[int]:
+    """Sort candidate indices by descending global-descriptor similarity.
+
+    When current_gdesc is None/empty (or a candidate has no cached descriptor),
+    those entries fall back to their original index order — they are still
+    eligible, just unranked.
+    """
+    if current_gdesc is None or current_gdesc.size == 0:
+        return list(indices)
+    scored: list[tuple[float, int, int]] = []
+    for orig_rank, i in enumerate(indices):
+        kf = keyframes.get_keyframe_by_index(i)
+        if kf is None:
+            continue
+        kf_gd = kf.get("_gdesc")
+        sim = global_similarity(current_gdesc, kf_gd) if kf_gd is not None else -1.0
+        # Negate sim so ascending sort puts highest similarity first; orig_rank
+        # is a stable secondary key so ties keep mission order.
+        scored.append((-sim, orig_rank, i))
+    scored.sort()
+    return [i for _, _, i in scored]
+
+
+def _build_candidate_indices(
+    keyframes: KeyframeManager,
+    sel: dict[str, Any],
+    current_gdesc: np.ndarray | None,
+) -> list[int]:
+    """Build the ordered list of keyframe indices to score with full ORB+RANSAC.
+
+    With enable_prefilter=True (default):
+        1. Restrict to a window [active - window_lookback, active + window_lookahead].
+           If both are 0, the window expands to the full sequence so the global
+           descriptor pre-rank still does useful work.
+        2. Rank candidates by global-descriptor cosine similarity to the current
+           frame.
+        3. Keep top_k (or all if top_k <= 0). Active is always kept and placed
+           first so the existing margin / forward-only-relocalize logic stays
+           stable on ties.
+
+    With enable_prefilter=False, fall back to the legacy forward-first scan
+    capped by max_keyframes_to_score.
+    """
+    total = keyframes.total
+    if total == 0:
+        return []
+    active = keyframes.active_index
+
+    if not sel.get("enable_prefilter", True):
+        return _scan_indices(active, total, int(sel.get("max_keyframes_to_score", 0)))
+
+    lookback = int(sel.get("window_lookback", 0))
+    lookahead = int(sel.get("window_lookahead", 0))
+    if lookback == 0 and lookahead == 0:
+        window = list(range(total))
+    else:
+        window = _windowed_indices(active, total, lookback, lookahead)
+        if active not in window:
+            window = [active, *window]
+
+    ranked = _rank_by_global_descriptor(window, keyframes, current_gdesc)
+
+    top_k = int(sel.get("top_k", 0))
+    if top_k > 0:
+        ranked = ranked[:top_k]
+
+    # Always score the active keyframe and place it at rank 0 so tie-breaking
+    # (rank < best_rank) prefers staying on the active reference, matching
+    # prefer_active_inlier_ratio_margin semantics.
+    if active in ranked:
+        ranked = [active, *[i for i in ranked if i != active]]
+    else:
+        ranked = [active, *ranked]
+
+    return ranked
 
 
 def _select_best_keyframe_match(
@@ -49,16 +150,28 @@ def _select_best_keyframe_match(
     keyframes: KeyframeManager,
     cfg: dict[str, Any],
     sel: dict[str, Any],
-) -> tuple[int | None, dict[str, Any] | None, str]:
+    current_gdesc: np.ndarray | None = None,
+) -> tuple[int | None, dict[str, Any] | None, str, dict[str, Any] | None]:
     """
-    Returns (best_index, match_result_for_that_keyframe, reason_if_none).
-    Tie: higher inlier_ratio, then more inliers, then earlier in forward-first scan order.
+    Returns (best_index, match_result_for_that_keyframe, reason_if_none, active_match).
+
+    `active_match` is the raw match result for the active keyframe when it was
+    in the candidate set (regardless of whether it cleared the selection
+    thresholds). Callers use it to avoid recomputing match_orb_features in the
+    margin / 'selector-wants-back' branches. None if the active keyframe was
+    not scored (only happens when the candidate set is empty).
+
+    Tie: higher inlier_ratio, then more inliers, then earlier in candidate
+    order. Active is placed at rank 0 in the candidate list so it wins ties.
     """
     total = keyframes.total
     if total == 0:
-        return None, None, "no_keyframes"
+        return None, None, "no_keyframes", None
     active = keyframes.active_index
-    indices = _scan_indices(active, total, sel["max_keyframes_to_score"])
+    indices = _build_candidate_indices(keyframes, sel, current_gdesc)
+    if not indices:
+        return None, None, "no_keyframes", None
+
     min_r = sel["min_inlier_ratio"]
     min_m = sel["min_matches"]
     min_i = sel["min_inliers"]
@@ -68,6 +181,7 @@ def _select_best_keyframe_match(
     best_ratio = -1.0
     best_inl = -1
     best_rank = 10**9
+    active_mr: dict[str, Any] | None = None
 
     for rank, i in enumerate(indices):
         kf = keyframes.get_keyframe_by_index(i)
@@ -82,6 +196,8 @@ def _select_best_keyframe_match(
             kf["_orb_hw"],
             cfg,
         )
+        if i == active:
+            active_mr = mr
         if not mr.get("valid"):
             continue
         if mr["num_matches"] < min_m or mr["num_inliers"] < min_i:
@@ -101,8 +217,8 @@ def _select_best_keyframe_match(
             best_ratio, best_inl, best_i, best_mr, best_rank = r, inl, i, mr, rank
 
     if best_i is None or best_mr is None:
-        return None, None, "no_keyframe_above_selection_threshold"
-    return best_i, best_mr, ""
+        return None, None, "no_keyframe_above_selection_threshold", active_mr
+    return best_i, best_mr, "", active_mr
 
 
 class AutonomyStack:
@@ -230,14 +346,26 @@ class AutonomyStack:
                 return yolo_cmd, debug_info
 
         kp_cur, des_cur, cur_hw = extract_orb_features(frame_bgr, self._cfg)
-        best_i, match_result, sel_reason = _select_best_keyframe_match(
-            kp_cur, des_cur, cur_hw, self._keyframes, self._cfg, sel
+
+        # Lightweight pre-filter input: compute the current frame's global
+        # descriptor once and reuse it for ranking all candidates. Skipped
+        # entirely when the prefilter is disabled in config.
+        if sel.get("enable_prefilter", True):
+            current_gdesc = compute_global_descriptor(
+                frame_bgr, self._keyframes.global_descriptor_size
+            )
+        else:
+            current_gdesc = None
+
+        best_i, match_result, sel_reason, active_mr = _select_best_keyframe_match(
+            kp_cur, des_cur, cur_hw, self._keyframes, self._cfg, sel, current_gdesc
         )
 
         selection_failed = best_i is None or match_result is None
 
         # Prefer staying on the mission-order active keyframe unless another candidate
         # beats it by a clear inlier_ratio margin. Stops flip-flop relocalize → stable reset.
+        # Reuses active_mr from the selection pass to avoid a second full ORB+RANSAC.
         margin = float(sel.get("prefer_active_inlier_ratio_margin", 0.0))
         if (
             not selection_failed
@@ -245,35 +373,24 @@ class AutonomyStack:
             and best_i is not None
             and match_result is not None
             and int(best_i) != int(self._keyframes.active_index)
+            and active_mr is not None
         ):
-            active_idx = int(self._keyframes.active_index)
-            kf_a = self._keyframes.get_keyframe_by_index(active_idx)
-            if kf_a is not None:
-                mr_a = match_orb_features(
-                    kp_cur,
-                    des_cur,
-                    cur_hw,
-                    kf_a["_orb_kp"],
-                    kf_a["_orb_des"],
-                    kf_a["_orb_hw"],
-                    self._cfg,
-                )
-                min_m = sel["min_matches"]
-                min_i = sel["min_inliers"]
-                min_r = sel["min_inlier_ratio"]
-                ok_a = (
-                    mr_a.get("valid")
-                    and int(mr_a["num_matches"]) >= min_m
-                    and int(mr_a["num_inliers"]) >= min_i
-                    and float(mr_a["inlier_ratio"]) >= min_r
-                )
-                if ok_a:
-                    r_best = float(match_result["inlier_ratio"])
-                    r_active = float(mr_a["inlier_ratio"])
-                    if r_active + margin >= r_best:
-                        best_i = active_idx
-                        match_result = mr_a
-                        sel_reason = ""
+            min_m = sel["min_matches"]
+            min_i = sel["min_inliers"]
+            min_r = sel["min_inlier_ratio"]
+            ok_a = (
+                active_mr.get("valid")
+                and int(active_mr["num_matches"]) >= min_m
+                and int(active_mr["num_inliers"]) >= min_i
+                and float(active_mr["inlier_ratio"]) >= min_r
+            )
+            if ok_a:
+                r_best = float(match_result["inlier_ratio"])
+                r_active = float(active_mr["inlier_ratio"])
+                if r_active + margin >= r_best:
+                    best_i = int(self._keyframes.active_index)
+                    match_result = active_mr
+                    sel_reason = ""
 
         selection_failed = best_i is None or match_result is None
         if not selection_failed:
@@ -300,25 +417,15 @@ class AutonomyStack:
             and best_i is not None
             and int(best_i) < int(self._keyframes.active_index)
         ):
-            # Selector wants to go back; refuse, but reuse the active keyframe's match
-            # so visual_error / confidence reflect the active reference.
+            # Selector wants to go back; refuse, but reuse the active keyframe's
+            # cached match so visual_error / confidence reflect the active reference.
             active_idx = int(self._keyframes.active_index)
-            kf_a = self._keyframes.get_keyframe_by_index(active_idx)
-            if kf_a is not None:
-                mr_a = match_orb_features(
-                    kp_cur,
-                    des_cur,
-                    cur_hw,
-                    kf_a["_orb_kp"],
-                    kf_a["_orb_des"],
-                    kf_a["_orb_hw"],
-                    self._cfg,
-                )
-                match_result = mr_a
+            if active_mr is not None:
+                match_result = active_mr
                 best_i = active_idx
                 debug_info["selection_keyframe_index"] = active_idx
-                debug_info["selection_best_ratio"] = float(mr_a.get("inlier_ratio", 0.0))
-                selection_failed = not bool(mr_a.get("valid", False))
+                debug_info["selection_best_ratio"] = float(active_mr.get("inlier_ratio", 0.0))
+                selection_failed = not bool(active_mr.get("valid", False))
 
         kf = self._keyframes.get_active_keyframe()
         if kf is None:

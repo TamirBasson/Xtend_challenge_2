@@ -7,6 +7,7 @@ from typing import Any
 import cv2
 import numpy as np
 
+from xlabs_nav.keyframe_prefilter import compute_global_descriptor
 from xlabs_nav.mission_config import MissionConfig
 from xlabs_nav.orb_matcher import extract_orb_features
 from xlabs_nav.orb_matcher import extract_orb_features
@@ -29,6 +30,14 @@ class KeyframeManager:
             raise ValueError(f"Keyframes manifest must be a non-empty list: {manifest_path}")
 
         entries.sort(key=lambda e: int(e.get("sequence_index", e.get("id", 0))))
+
+        # Global-descriptor pre-filter is read here so it can be cached once
+        # per keyframe at load time. Falls back to a 32x32 thumbnail when the
+        # config block is absent so older mission configs still work.
+        ks_cfg = mission.raw.get("keyframe_selection") or {}
+        gdesc_size = int(ks_cfg.get("global_descriptor_size", 32))
+
+        self._gdesc_size = gdesc_size
         self._keyframes: list[dict[str, Any]] = []
         for row in entries:
             img_rel = row.get("image_path")
@@ -41,6 +50,7 @@ class KeyframeManager:
             if bgr is None:
                 raise RuntimeError(f"Failed to read keyframe image: {img_path}")
             orb_kp, orb_des, orb_hw = extract_orb_features(bgr, mission.raw)
+            gdesc = compute_global_descriptor(bgr, gdesc_size)
             self._keyframes.append(
                 {
                     **row,
@@ -49,6 +59,7 @@ class KeyframeManager:
                     "_orb_kp": orb_kp,
                     "_orb_des": orb_des,
                     "_orb_hw": orb_hw,
+                    "_gdesc": gdesc,
                 }
             )
 
@@ -62,6 +73,11 @@ class KeyframeManager:
     @property
     def active_index(self) -> int:
         return self._active_index
+
+    @property
+    def global_descriptor_size(self) -> int:
+        """Side length used when computing cached keyframe global descriptors."""
+        return self._gdesc_size
 
     def is_complete(self) -> bool:
         return self._mission_complete
