@@ -1,0 +1,7 @@
+cmake
+ndi-python
+opencv-python
+numpy
+keyboard
+PyYAML
+ultralytics
