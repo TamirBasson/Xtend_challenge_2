@@ -71,7 +71,7 @@ keyframe_selection:
   global_descriptor_size: 32   # thumbnail side; 32 -> 1024-D descriptor
 
 controller:
-  K_yaw: 4.0
+  K_yaw: 15.0
   K_altitude: 1.0
   K_forward: 1.5
   K_strafe: 0.0
