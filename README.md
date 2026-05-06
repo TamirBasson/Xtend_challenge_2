@@ -29,7 +29,9 @@ This approach keeps the navigation stack lightweight, interpretable, and practic
 
 The navigation loop is organized as a visual-feedback control pipeline:
 
-![Visual Navigation Architecture](assets/Visual_Nav_Architecture.jpg)
+<p align="center">
+  <img src="assets/Visual_Nav_Architecture.jpg" width="600"/>
+</p>
 
 1. **Camera Input**  
    The drone captures live RGB frames from the onboard simulation camera.
