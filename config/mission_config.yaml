@@ -1,0 +1,136 @@
+# Paths relative to repository root (directory containing xlabs_nav/).
+keyframes:
+  manifest_path: data/keyframes/keyframes.json
+  base_dir: .
+
+orb:
+  nfeatures: 1000
+  scale_factor: 1.2
+  nlevels: 8
+  edge_threshold: 31
+  first_level: 0
+  WTA_K: 2
+  score_type: 0
+  patch_size: 31
+  fast_threshold: 20
+
+matching:
+  bf_cross_check: true
+  max_match_distance: 80
+  ransac_method: 8   # cv2.RANSAC
+  ransac_reproj_threshold: 5.0
+  max_draw_matches: 200
+
+quality:
+  minimum_matches: 12
+  minimum_inliers: 8
+  minimum_inlier_ratio: 0.2
+  high_confidence_inlier_ratio: 0.35
+
+# Advance to the next keyframe when:
+#   visual_error is valid AND raw error_norm < error_norm_threshold
+# held for required_stable_frames consecutive frames.
+# Recovery / confidence are no longer gates — minimum_inliers and minimum_inlier_ratio
+# in `quality:` already filter weak matches via visual_error.valid.
+# Backward relocalize is forbidden in code (no flip-flop after advance).
+convergence:
+  error_norm_threshold: 0.05
+  required_stable_frames: 3
+  # error_ema_alpha is overlay-only now; advance gate uses RAW error_norm.
+  error_ema_alpha: 0.35
+  # If false, a bad frame only decrements stable counter (see stable_decrement_on_bad).
+  strict_stable_reset: false
+  stable_decrement_on_bad: 1
+
+# Dynamic keyframe pick: ORB-score a small candidate set (cached ref descriptors),
+# best inlier_ratio wins. The candidate set is built in two cheap stages
+# (window + global-descriptor pre-rank) so per-frame cost stays bounded as the
+# number of keyframes grows.
+keyframe_selection:
+  min_inlier_ratio: 0.2
+  min_matches: 12
+  min_inliers: 8
+  # Legacy cap on the forward-first scan. Only applies when enable_prefilter=false.
+  max_keyframes_to_score: 0
+  # Stay on the active keyframe unless another scores higher by more than this
+  # (inlier_ratio). Reduces relocalize flip-flop that resets convergence counter.
+  prefer_active_inlier_ratio_margin: 0.04
+
+  # --- Real-time pre-filter (reduces full ORB+RANSAC matches per frame) ---
+  # Stage 1: restrict candidates to a window around the active keyframe in
+  #   mission order, [active - window_lookback, active + window_lookahead].
+  # Stage 2: rank the window by a tiny zero-mean L2-normalized 32x32 grayscale
+  #   thumbnail (cosine similarity vs the current frame) and keep top_k.
+  # The active keyframe is always kept and scored first regardless of rank.
+  # Set enable_prefilter=false to fall back to the legacy forward-first scan
+  # (capped by max_keyframes_to_score above).
+  enable_prefilter: true
+  window_lookahead: 2     # forward neighbors of active in mission order
+  window_lookback: 1      # backward neighbors (small; backward relocalize is forbidden)
+  top_k: 2                # max keyframes scored per frame after pre-rank (0 = no cap)
+  global_descriptor_size: 32   # thumbnail side; 32 -> 1024-D descriptor
+
+controller:
+  K_yaw: 4.0
+  K_altitude: 1.0
+  K_forward: 1.5
+  K_strafe: 0.0
+  Ki_yaw: 0.02
+  Ki_altitude: 0.02
+  Ki_forward: 0.1
+  Ki_strafe: 0.1
+  Kd_yaw: 0.0
+  Kd_altitude: 0.12
+  Kd_forward: 0.1
+  Kd_strafe: 0.1
+  integral_max: 0.25
+  integral_decay: 0.0
+  command_duration: 0.15
+  max_yaw: 1.0
+  max_altitude: 1.0
+  max_forward: 1.0
+  max_strafe: 1.0
+
+recovery:
+  yaw_magnitude: 0.14
+  alternate_frames: 75
+
+overlay:
+  thumbnail_width: 240
+  max_keypoints_drawn: 600
+
+network:
+  host: "127.0.0.1"
+  port: 65432
+
+# YOLO target tracking. When enabled, a confident detection preempts keyframe
+# navigation: the drone visual-servos toward the bbox center until centered,
+# and falls back to keyframe nav after lost_frames_tolerance frames without a
+# detection. NOTE: scripts/run_navigation.py applies NAV_SPEED_SCALE=0.2 to
+# every command, so the max_* and forward_speed values below are pre-scale.
+yolo:
+  enabled: true
+  model_path: best.pt           # resolved relative to repo root if not absolute
+  confidence_threshold: 0.65
+  target_classes: ["gun"]       # null or [] = accept any class
+  inference_imgsz: 640
+  device: ""                    # "" auto, "cpu", or "0" for cuda:0
+  inference_every_n_frames: 1   # bump to 2-3 on slow CPUs (cached bbox is reused)
+
+  center_tolerance_px: 20       # stop when |error_x_px| AND |error_y_px| < this
+  lost_frames_tolerance: 10     # frames with no detection before falling back
+
+  K_yaw: 1.5
+  Kd_yaw: 0.0
+  K_altitude: 1.0
+  Kd_altitude: 0.0
+  K_strafe: 0.0                 # 0 disables strafe (yaw-only by default)
+  Kd_strafe: 0.0
+  forward_speed: 0.4
+  forward_engage_norm_error: 0.6  # only push forward when normalized error norm below this
+
+  max_yaw: 1.0
+  max_altitude: 1.0
+  max_forward: 1.0
+  max_strafe: 1.0
+  command_duration: 0.15
